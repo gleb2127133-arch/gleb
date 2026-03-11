@@ -1,577 +1,461 @@
-"""
-AutoHunter Bot — парсер выгодных объявлений о продаже авто
-Источники: Авито, Авто.ру, Дром, Юла
-"""
-
 import asyncio
 import logging
 import json
 import os
 import re
 import random
-from datetime import datetime, timedelta
+import hashlib
+from dataclasses import dataclass, field
 from typing import Optional
 
 import httpx
 from bs4 import BeautifulSoup
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command, StateFilter
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler()],
+)
 log = logging.getLogger(__name__)
 
-CONFIG_FILE = "config.json"
-SEEN_FILE = "seen_ads.json"
+BOT_TOKEN = "8729431872:AAEMuCl2pEx8zd8_o1Twvvy4LeGB-oNMW7E"
+CHAT_ID   = "423771186"
 
-DEFAULT_CONFIG = {
-    "BOT_TOKEN": "8729431872:AAEMuCl2pEx8zd8_o1Twvvy4LeGB-oNMW7E",
-    "CHAT_ID": "423771186",
-    "CHECK_INTERVAL": 10,
-    "filters": {
-        "price_min": 300000,
-        "price_max": 3000000,
-        "year_min": 2012,
-        "year_max": 2025,
-        "mileage_max": 200000,
-        "discount_min": 10,
-        "regions": ["москва", "московская"],
-        "brands": [],
-        "keywords_urgent": ["срочно","срочная","торг","уезжаю","переезд","продам быстро","дёшево","дешево","отдам","срочно продам"],
-        "sources": ["avito","autoru","drom","youla"]
-    }
+SEEN_FILE    = "seen_ads.json"
+FILTERS_FILE = "filters.json"
+
+DEFAULT_FILTERS = {
+    "price_min":      0,
+    "price_max":      5_000_000,
+    "year_min":       2010,
+    "year_max":       2025,
+    "mileage_max":    200_000,
+    "discount_min":   10,
+    "regions":        ["moskva"],
+    "brands":         [],
+    "check_interval": 15,
+    "urgent_only":    False,
+    "score_min":      40,
 }
 
-def load_config():
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE,"r",encoding="utf-8") as f:
-            return json.load(f)
-    save_config(DEFAULT_CONFIG)
-    return DEFAULT_CONFIG.copy()
+AVITO_REGIONS = {
+    "moskva":           "moskva",
+    "spb":              "sankt-peterburg",
+    "ekaterinburg":     "ekaterinburg",
+    "novosibirsk":      "novosibirsk",
+    "krasnodar":        "krasnodar",
+    "kazan":            "kazan",
+    "nizhniy_novgorod": "nizhniy_novgorod",
+    "rostov":           "rostov-na-donu",
+    "ufa":              "ufa",
+    "samara":           "samara",
+}
 
-def save_config(cfg):
-    with open(CONFIG_FILE,"w",encoding="utf-8") as f:
-        json.dump(cfg,f,ensure_ascii=False,indent=2)
+HEADERS_POOL = [
+    {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.5",
+        "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+    },
+    {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/17.0 Safari/605.1.15",
+        "Accept-Language": "ru-RU,ru;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+    },
+]
+
+@dataclass
+class CarAd:
+    id:           str
+    title:        str
+    price:        int
+    market_price: int
+    year:         int
+    mileage:      int
+    region:       str
+    url:          str
+    source:       str
+    posted_at:    str
+    signals:      list = field(default_factory=list)
+    score:        int  = 0
+
+    @property
+    def discount_pct(self):
+        if self.market_price <= 0:
+            return 0.0
+        return round((self.market_price - self.price) / self.market_price * 100, 1)
+
+    @property
+    def discount_rub(self):
+        return max(0, self.market_price - self.price)
+
 
 def load_seen():
     if os.path.exists(SEEN_FILE):
-        with open(SEEN_FILE,"r") as f:
+        with open(SEEN_FILE) as f:
             return set(json.load(f))
     return set()
 
 def save_seen(seen):
-    with open(SEEN_FILE,"w") as f:
-        json.dump(list(seen)[-5000:],f)
+    with open(SEEN_FILE, "w") as f:
+        json.dump(list(seen), f)
 
-HEADERS_POOL = [
-    {"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36","Accept-Language":"ru-RU,ru;q=0.9","Accept":"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8","Referer":"https://www.google.com/"},
-    {"User-Agent":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15","Accept-Language":"ru-RU,ru;q=0.8","Accept":"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
-    {"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36","Accept-Language":"ru,en;q=0.9","Accept":"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"},
-]
+def load_filters():
+    if os.path.exists(FILTERS_FILE):
+        with open(FILTERS_FILE) as f:
+            return {**DEFAULT_FILTERS, **json.load(f)}
+    return DEFAULT_FILTERS.copy()
 
-def get_headers():
-    return random.choice(HEADERS_POOL)
+def save_filters(filters):
+    with open(FILTERS_FILE, "w") as f:
+        json.dump(filters, f, ensure_ascii=False, indent=2)
 
-MARKET_PRICES = {
-    "toyota camry":2200000,"toyota corolla":1400000,"toyota rav4":2800000,
-    "bmw 3":2000000,"bmw 5":2800000,"bmw x5":4500000,
-    "mercedes c":2500000,"mercedes e":3200000,
-    "kia optima":1600000,"kia rio":1100000,"kia sportage":2200000,"kia k5":2000000,
-    "hyundai solaris":1100000,"hyundai creta":1900000,"hyundai elantra":1600000,
-    "volkswagen polo":1100000,"volkswagen tiguan":2600000,"volkswagen passat":1800000,
-    "audi a4":2700000,"audi a6":3500000,"audi q5":3800000,
-    "nissan qashqai":2000000,"nissan x-trail":2100000,"nissan teana":1500000,
-    "ford focus":900000,"ford kuga":1800000,
-    "mazda 6":1600000,"mazda cx-5":2200000,"mazda 3":1200000,
-    "honda cr-v":2400000,"honda accord":1800000,
-    "skoda octavia":1500000,"skoda kodiaq":2500000,
-    "lada vesta":900000,"lada granta":650000,"lada x-ray":800000,
-    "renault duster":1200000,"renault logan":800000,
-    "default":1500000,
-}
 
-def get_market_price(title):
-    t = title.lower()
-    for key,price in MARKET_PRICES.items():
-        if key in t:
-            return price
-    return MARKET_PRICES["default"]
+class AvitoParser:
+    BASE = "https://www.avito.ru"
 
-def parse_price(text):
-    text = str(text).replace('\xa0',' ').replace(' ','').replace(',','')
-    nums = re.findall(r'\d+',text)
-    if nums:
-        try:
-            val = int(''.join(nums[:2]))
-            if val > 100000000: val = val // 100  # копейки
-            return val
-        except:pass
-    return 0
-
-def parse_mileage(text):
-    m = re.search(r'(\d[\d\s]*)\s*км',text.replace('\xa0',' '))
-    if m:
-        try: return int(m.group(1).replace(' ',''))
-        except: pass
-    return 0
-
-def parse_year(text):
-    m = re.search(r'\b(19[89]\d|20[012]\d)\b',text)
-    return int(m.group(0)) if m else 0
-
-def parse_date_text(text):
-    text = text.lower().strip()
-    now = datetime.now()
-    if 'только что' in text: return now
-    if 'сегодня' in text:
-        m = re.search(r'(\d+):(\d+)',text)
-        if m: return now.replace(hour=int(m.group(1)),minute=int(m.group(2)),second=0)
-        return now
-    if 'вчера' in text:
-        m = re.search(r'(\d+):(\d+)',text)
-        if m: return (now-timedelta(days=1)).replace(hour=int(m.group(1)),minute=int(m.group(2)))
-        return now-timedelta(days=1)
-    m = re.search(r'(\d+)\s*мин',text)
-    if m: return now-timedelta(minutes=int(m.group(1)))
-    m = re.search(r'(\d+)\s*час',text)
-    if m: return now-timedelta(hours=int(m.group(1)))
-    return now
-
-class Ad:
     def __init__(self):
-        self.id=self.title=self.price_str=self.url=self.source=self.region=self.description=""
-        self.price=self.year=self.mileage=self.score=self.market_price=0
-        self.discount_pct=0.0
-        self.signals=[]
-        self.posted_at=None
+        self.client = httpx.AsyncClient(timeout=25, follow_redirects=True)
 
-async def fetch(client,url):
-    try:
-        await asyncio.sleep(random.uniform(1.5,3.5))
-        r = await client.get(url,headers=get_headers(),timeout=25,follow_redirects=True)
-        return r.text if r.status_code==200 else None
-    except Exception as e:
-        log.error(f"Fetch error {url}: {e}")
+    async def _get(self, url):
+        headers = random.choice(HEADERS_POOL)
+        try:
+            await asyncio.sleep(random.uniform(2.0, 4.0))
+            r = await self.client.get(url, headers=headers)
+            if r.status_code == 200:
+                return r.text
+            log.warning(f"Авито [{r.status_code}]")
+        except Exception as e:
+            log.error(f"Авито: {e}")
         return None
 
-async def parse_avito(client,filters):
-    ads=[]
-    rmap={"москва":"moskva","московская":"moskovskaya_oblast","санкт-петербург":"sankt-peterburg","спб":"sankt-peterburg","екатеринбург":"ekaterinburg","новосибирск":"novosibirsk","краснодар":"krasnodar","казань":"kazan","нижний новгород":"nizhegorodskaya_oblast","ростов":"rostov-na-donu","самара":"samara","уфа":"ufa"}
-    regions=filters.get("regions",["москва"])
-    pmin=filters.get("price_min",0)
-    pmax=filters.get("price_max",9999999)
-    for reg in regions[:2]:
-        slug=rmap.get(reg.lower(),"rossiya")
-        url=f"https://www.avito.ru/{slug}/avtomobili?pmin={pmin}&pmax={pmax}&s=104"
-        html=await fetch(client,url)
-        if not html: continue
-        soup=BeautifulSoup(html,"lxml")
-        items=soup.select('[data-marker="item"]') or soup.select('.iva-item-root')
-        for item in items[:25]:
+    def _num(self, text):
+        nums = re.sub(r"[^\d]", "", text)
+        return int(nums) if nums else 0
+
+    def _year(self, text):
+        m = re.search(r"\b(20[0-2]\d|199\d)\b", text)
+        return int(m.group()) if m else 0
+
+    def _is_night(self, posted):
+        m = re.search(r"(\d{1,2}):(\d{2})", posted)
+        return 0 <= int(m.group(1)) < 7 if m else False
+
+    def _is_urgent(self, text):
+        kw = ["срочно", "срочная", "уезжаю", "переезд", "вынужден", "нужны деньги", "торг уместен"]
+        return any(k in text.lower() for k in kw)
+
+    def _market_price(self, price, year, mileage):
+        age = max(0, 2025 - (year or 2018))
+        depreciation = max(0.40, 1.0 - age * 0.055)
+        base = price / depreciation
+        km = mileage or 80_000
+        expected = age * 15_000
+        if km < expected * 0.5:
+            base *= 1.10
+        elif km > expected * 1.8:
+            base *= 0.93
+        return int(base)
+
+    def _score(self, ad):
+        s = min(50, ad.discount_pct * 2.5)
+        if "urgent"      in ad.signals: s += 15
+        if "night"       in ad.signals: s += 10
+        if "price_drop"  in ad.signals: s += 12
+        if "low_mileage" in ad.signals: s += 8
+        if ad.year >= 2018:             s += 5
+        return min(100, int(s))
+
+    async def fetch(self, region, filters):
+        brand_part = ""
+        if filters.get("brands"):
+            brand_part = filters["brands"][0].lower() + "/"
+        url = (
+            f"{self.BASE}/{region}/avtomobili/{brand_part}"
+            f"?s=104&pmin={filters.get('price_min',0)}&pmax={filters.get('price_max',9999999)}"
+        )
+        html = await self._get(url)
+        if not html:
+            return []
+
+        soup  = BeautifulSoup(html, "html.parser")
+        items = soup.select("[data-marker='item']")
+        log.info(f"Авито [{region}]: {len(items)} карточек")
+
+        ads = []
+        for item in items[:40]:
             try:
-                ad=Ad(); ad.source="avito"
-                te=item.select_one('[itemprop="name"]') or item.select_one('.iva-item-title')
-                if te: ad.title=te.get_text(strip=True)
-                pe=item.select_one('[itemprop="price"]') or item.select_one('[data-marker="item-price"]')
-                if pe:
-                    pv=pe.get('content') or pe.get_text()
-                    ad.price=parse_price(pv); ad.price_str=pe.get_text(strip=True)
-                le=item.select_one('a[data-marker="item-title"]') or item.select_one('a.iva-item-title-py3i_')
-                if le:
-                    href=le.get('href','')
-                    ad.url=f"https://www.avito.ru{href}" if href.startswith('/') else href
-                    m=re.search(r'_(\d+)$',href)
-                    ad.id=f"avito_{m.group(1)}" if m else f"avito_{hash(href)}"
-                ge=item.select_one('[data-marker="item-location"]')
-                if ge: ad.region=ge.get_text(strip=True)
-                de=item.select_one('[data-marker="item-description"]')
-                if de: ad.description=de.get_text(strip=True)
-                ft=f"{ad.title} {ad.description}"
-                ad.year=parse_year(ft); ad.mileage=parse_mileage(ft)
-                date_el=item.select_one('[data-marker="item-date"]')
-                ad.posted_at=parse_date_text(date_el.get_text()) if date_el else datetime.now()
-                if ad.title and ad.price>0 and ad.url: ads.append(ad)
-            except Exception as e: log.debug(f"avito item: {e}")
-    return ads
+                title_el = item.select_one("[itemprop='name']") or item.select_one("h3")
+                if not title_el:
+                    continue
+                title = title_el.get_text(strip=True)
 
-async def parse_autoru(client,filters):
-    ads=[]
-    rmap={"москва":"moskva","санкт-петербург":"sankt-peterburg","спб":"sankt-peterburg","екатеринбург":"ekaterinburg","новосибирск":"novosibirsk","краснодар":"krasnodar","казань":"kazan"}
-    regions=filters.get("regions",["москва"])
-    slug=rmap.get(regions[0].lower(),"rossiya") if regions else "rossiya"
-    pmin=filters.get("price_min",0); pmax=filters.get("price_max",9999999)
-    url=f"https://auto.ru/{slug}/cars/used/?price_from={pmin}&price_to={pmax}&sort=fresh_relevance_1-desc&output_type=list"
-    html=await fetch(client,url)
-    if not html: return ads
-    soup=BeautifulSoup(html,"lxml")
-    items=soup.select('.ListingItem') or soup.select('[class*="ListingItem_"]')
-    for item in items[:25]:
-        try:
-            ad=Ad(); ad.source="autoru"
-            te=item.select_one('[class*="ListingItemTitle"]')
-            if te: ad.title=te.get_text(strip=True)
-            pe=item.select_one('[class*="ListingItemPrice"]')
-            if pe: ad.price_str=pe.get_text(strip=True); ad.price=parse_price(ad.price_str)
-            le=item.select_one('a[href*="/cars/"]')
-            if le:
-                href=le.get('href','')
-                ad.url=href if href.startswith('http') else f"https://auto.ru{href}"
-                m=re.search(r'/(\d+)-',href)
-                ad.id=f"autoru_{m.group(1)}" if m else f"autoru_{hash(href)}"
-            pt=item.get_text()
-            ad.year=parse_year(ad.title or pt); ad.mileage=parse_mileage(pt)
-            re_el=item.select_one('[class*="MetroListPlace"]')
-            if re_el: ad.region=re_el.get_text(strip=True)
-            de=item.select_one('[class*="date"]')
-            ad.posted_at=parse_date_text(de.get_text()) if de else datetime.now()
-            if ad.title and ad.price>0 and ad.url: ads.append(ad)
-        except Exception as e: log.debug(f"autoru item: {e}")
-    return ads
+                link_el = item.select_one("a[data-marker='item-title']") or item.select_one("a[href*='/avtomobili/']")
+                href    = link_el.get("href", "") if link_el else ""
+                full_url = (self.BASE + href) if href.startswith("/") else href
 
-async def parse_drom(client,filters):
-    ads=[]
-    rmap={"москва":"moscow","санкт-петербург":"spb","спб":"spb","екатеринбург":"ekaterinburg","новосибирск":"novosibirsk","краснодар":"krasnodar"}
-    regions=filters.get("regions",[""])
-    slug=rmap.get(regions[0].lower(),"") if regions else ""
-    rpart=f"{slug}/" if slug else ""
-    pmin=filters.get("price_min",0); pmax=filters.get("price_max",9999999)
-    url=f"https://auto.drom.ru/{rpart}all/?minprice={pmin}&maxprice={pmax}&order=date_desc"
-    html=await fetch(client,url)
-    if not html: return ads
-    soup=BeautifulSoup(html,"lxml")
-    items=soup.select('[data-ftid="bull_item"]') or soup.select('.bull-item')
-    for item in items[:25]:
-        try:
-            ad=Ad(); ad.source="drom"
-            te=item.select_one('[data-ftid="bull_item_title"]') or item.select_one('h3')
-            if te: ad.title=te.get_text(strip=True)
-            pe=item.select_one('[data-ftid="bull_item_price"]')
-            if pe: ad.price_str=pe.get_text(strip=True); ad.price=parse_price(ad.price_str)
-            le=item.select_one('a[data-ftid="bull_item_title"]') or item.select_one('h3 a')
-            if le:
-                href=le.get('href','')
-                ad.url=href if href.startswith('http') else f"https://auto.drom.ru{href}"
-                m=re.search(r'/(\d+)\.html',href)
-                ad.id=f"drom_{m.group(1)}" if m else f"drom_{hash(href)}"
-            pt=item.get_text()
-            ad.year=parse_year(ad.title or pt); ad.mileage=parse_mileage(pt)
-            ce=item.select_one('[data-ftid="bull_item_location"]')
-            if ce: ad.region=ce.get_text(strip=True)
-            de=item.select_one('[data-ftid="bull_item_date"]')
-            ad.posted_at=parse_date_text(de.get_text()) if de else datetime.now()
-            desc_e=item.select_one('[data-ftid="bull_item_description"]')
-            if desc_e: ad.description=desc_e.get_text(strip=True)
-            if ad.title and ad.price>0 and ad.url: ads.append(ad)
-        except Exception as e: log.debug(f"drom item: {e}")
-    return ads
+                price_el  = item.select_one("[itemprop='price']") or item.select_one("[data-marker='item-price']")
+                price_raw = (price_el.get("content") or price_el.get_text() if price_el else "0")
+                price     = self._num(price_raw)
+                if price <= 0:
+                    continue
 
-async def parse_youla(client,filters):
-    ads=[]
-    pmin=filters.get("price_min",0); pmax=filters.get("price_max",9999999)
-    try:
-        await asyncio.sleep(random.uniform(1,2))
-        r=await client.get("https://youla.ru/web-api/feed/listing",params={"category_slug":"transport_cars","price__gte":pmin,"price__lte":pmax,"sort_field":"date"},headers=get_headers(),timeout=20)
-        if r.status_code!=200: return ads
-        items=r.json().get("data",{}).get("products",[]) or []
-        for item in items[:20]:
-            try:
-                ad=Ad(); ad.source="youla"
-                ad.id=f"youla_{item.get('id','')}"
-                ad.title=item.get("name","")
-                pr=item.get("price",0)
-                ad.price=int(pr)//100 if pr>100000 else int(pr)
-                ad.price_str=f"{ad.price:,} ₽"
-                ad.url=f"https://youla.ru/p/{item.get('slug',item.get('id',''))}"
-                ad.region=item.get("location",{}).get("name","")
-                ad.description=item.get("description","")
-                for prop in item.get("attributes",[]):
-                    if prop.get("slug")=="year": ad.year=int(prop.get("value",0) or 0)
-                    if prop.get("slug")=="mileage": ad.mileage=int(prop.get("value",0) or 0)
-                ts=item.get("publishedAt") or item.get("sortDate")
-                if ts: ad.posted_at=datetime.fromtimestamp(ts)
-                if ad.title and ad.price>0: ads.append(ad)
-            except: pass
-    except Exception as e: log.error(f"Youla: {e}")
-    return ads
+                params  = " ".join(el.get_text() for el in item.select("[data-marker='item-specific-params'] li"))
+                year    = self._year(title + " " + params)
+                mileage = self._num(params) * (1000 if "тыс" in params.lower() else 1)
 
-def analyze_ad(ad,filters):
-    signals=[]; score=0
-    desc=(ad.description+" "+ad.title).lower()
-    for w in filters.get("keywords_urgent",[]):
-        if w in desc: signals.append("🔴 Срочная продажа"); score+=20; break
-    if ad.posted_at:
-        h=ad.posted_at.hour
-        if h>=22 or h<=6: signals.append("🌙 Выложено ночью"); score+=10
-        age=datetime.now()-ad.posted_at
-        if age<timedelta(hours=3): signals.append("🟢 Новое (< 3ч)"); score+=15
-        elif age<timedelta(hours=24): signals.append("📅 Сегодня"); score+=5
-    if ad.price>0:
-        market=get_market_price(ad.title); ad.market_price=market
-        disc=((market-ad.price)/market)*100; ad.discount_pct=round(disc,1)
-        if disc>=30: signals.append(f"💰 -{disc:.0f}% от рынка"); score+=35
-        elif disc>=20: signals.append(f"💰 -{disc:.0f}% от рынка"); score+=25
-        elif disc>=10: signals.append(f"📉 -{disc:.0f}% от рынка"); score+=15
-    if 0<ad.mileage<80000: signals.append(f"📍 Малый пробег"); score+=10
-    if any(w in desc for w in ["торг","торгуюсь","цена снижена","снизил"]): signals.append("💬 Есть торг"); score+=8
-    ad.signals=signals; ad.score=min(score,100)
-    return ad
+                date_el = item.select_one("[data-marker='item-date']")
+                posted  = date_el.get_text(strip=True) if date_el else ""
 
-def apply_filters(ads,filters):
-    out=[]
-    pmin=filters.get("price_min",0); pmax=filters.get("price_max",99999999)
-    ymin=filters.get("year_min",0); ymax=filters.get("year_max",9999)
-    mmax=filters.get("mileage_max",9999999); dmin=filters.get("discount_min",0)
-    brands=[b.lower() for b in filters.get("brands",[])]
-    for ad in ads:
-        if ad.price and (ad.price<pmin or ad.price>pmax): continue
-        if ad.year and (ad.year<ymin or ad.year>ymax): continue
-        if ad.mileage and ad.mileage>mmax: continue
-        if dmin and ad.discount_pct<dmin: continue
-        if brands and not any(b in ad.title.lower() for b in brands): continue
-        out.append(ad)
-    return out
+                desc_el = item.select_one("[data-marker='item-description']")
+                desc    = desc_el.get_text(strip=True)[:300] if desc_el else ""
 
-SRC_NAMES={"avito":"🟢 Авито","autoru":"🔵 Авто.ру","drom":"🟠 Дром","youla":"🟣 Юла"}
+                if year    and year    < filters["year_min"]:    continue
+                if year    and year    > filters["year_max"]:    continue
+                if mileage and mileage > filters["mileage_max"]: continue
+                if price < filters["price_min"]: continue
+                if price > filters["price_max"]: continue
 
-def format_ad(ad):
-    src=SRC_NAMES.get(ad.source,ad.source)
-    bar="█"*(ad.score//10)+"░"*(10-ad.score//10)
-    lines=[f"🚗 <b>{ad.title}</b>","",f"💵 <b>{ad.price_str or f'{ad.price:,} ₽'}</b>"]
-    if ad.market_price and ad.discount_pct>0:
-        lines+=[f"📊 Рынок: ~{ad.market_price:,} ₽  <b>(-{ad.discount_pct:.0f}%)</b>",f"💰 Выгода: ~{(ad.market_price-ad.price):,} ₽"]
-    if ad.year: lines.append(f"📅 Год: {ad.year}")
-    if ad.mileage: lines.append(f"🛣 Пробег: {ad.mileage:,} км")
-    if ad.region: lines.append(f"📍 {ad.region}")
-    lines+=["",f"🎯 Рейтинг: {ad.score}/100  {bar}"]
-    if ad.signals: lines+=["","<b>Сигналы:</b>"]+[f"  {s}" for s in ad.signals]
-    if ad.posted_at:
-        age=datetime.now()-ad.posted_at
-        if age.total_seconds()<3600: ts=f"{int(age.total_seconds()//60)} мин назад"
-        elif age.total_seconds()<86400: ts=f"{int(age.total_seconds()//3600)} ч назад"
-        else: ts=ad.posted_at.strftime("%d.%m %H:%M")
-        lines.append(f"🕐 Опубликовано: {ts}")
-    lines+=["",f"📢 {src}",f"🔗 <a href='{ad.url}'>Открыть объявление →</a>"]
-    return "\n".join(lines)
+                market = self._market_price(price, year, mileage)
+                disc   = (market - price) / market * 100 if market else 0
+                if disc < filters["discount_min"]:
+                    continue
 
-class Scanner:
-    def __init__(self,bot):
-        self.bot=bot; self.running=False; self.task=None
-        self.seen=load_seen(); self.last_scan=None; self.total_sent=0
+                signals = []
+                if self._is_urgent(title + " " + desc):  signals.append("urgent")
+                if self._is_night(posted):                signals.append("night")
+                if re.search(r"снизил|снижена", desc.lower()): signals.append("price_drop")
+                if mileage and mileage < 80_000:          signals.append("low_mileage")
 
-    async def scan_once(self,cfg):
-        filters=cfg.get("filters",{}); sources=filters.get("sources",["avito","autoru","drom"])
-        all_ads=[]
-        async with httpx.AsyncClient() as client:
-            tasks=[]
-            if "avito" in sources: tasks.append(parse_avito(client,filters))
-            if "autoru" in sources: tasks.append(parse_autoru(client,filters))
-            if "drom" in sources: tasks.append(parse_drom(client,filters))
-            if "youla" in sources: tasks.append(parse_youla(client,filters))
-            results=await asyncio.gather(*tasks,return_exceptions=True)
-            for r in results:
-                if isinstance(r,list): all_ads.extend(r)
-        for ad in all_ads: analyze_ad(ad,filters)
-        filtered=apply_filters(all_ads,filters)
-        new=[ad for ad in filtered if ad.id and ad.id not in self.seen]
-        new.sort(key=lambda x:x.score,reverse=True)
-        self.last_scan=datetime.now()
-        return new
+                if filters.get("urgent_only") and "urgent" not in signals:
+                    continue
 
-    async def run_loop(self,cfg):
-        self.running=True
-        chat_id=cfg.get("CHAT_ID"); interval=cfg.get("CHECK_INTERVAL",15)
-        await self.bot.send_message(chat_id,
-            f"🟢 <b>AutoHunter запущен!</b>\n\n⏱ Проверка каждые <b>{interval} мин</b>\n"
-            f"📡 Источники: {', '.join(cfg['filters'].get('sources',[]))}\n"
-            f"💰 Цена: {cfg['filters'].get('price_min',0):,} — {cfg['filters'].get('price_max',0):,} ₽\n"
-            f"📅 Год: {cfg['filters'].get('year_min')} — {cfg['filters'].get('year_max')}\n\nЖду выгодных объявлений... 🎯",parse_mode="HTML")
-        while self.running:
-            try:
-                cfg=load_config()
-                new=await self.scan_once(cfg)
-                log.info(f"Scan done. New: {len(new)}")
-                for ad in new[:10]:
-                    try:
-                        await self.bot.send_message(chat_id,format_ad(ad),parse_mode="HTML")
-                        self.seen.add(ad.id); self.total_sent+=1
-                        await asyncio.sleep(1.2)
-                    except Exception as e: log.error(f"Send: {e}")
-                save_seen(self.seen)
-            except Exception as e: log.error(f"Loop: {e}")
-            await asyncio.sleep(interval*60)
+                ad = CarAd(
+                    id=hashlib.md5(full_url.encode()).hexdigest()[:12],
+                    title=title, price=price, market_price=market,
+                    year=year, mileage=mileage, region=region,
+                    url=full_url, source="avito", posted_at=posted, signals=signals,
+                )
+                ad.score = self._score(ad)
+                if ad.score >= filters.get("score_min", 40):
+                    ads.append(ad)
+            except Exception as e:
+                log.debug(f"Карточка: {e}")
+        return ads
 
-    def start(self,cfg):
-        if not self.running: self.task=asyncio.create_task(self.run_loop(cfg))
+    async def close(self):
+        await self.client.aclose()
 
-    def stop(self):
-        self.running=False
-        if self.task: self.task.cancel()
 
-class S(StatesGroup):
-    setting=State()
-
-scanner=None
-
-def kb():
-    return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="▶️ Запустить"),KeyboardButton(text="⏹ Остановить")],
-        [KeyboardButton(text="📊 Статус"),KeyboardButton(text="🔍 Проверить сейчас")],
-        [KeyboardButton(text="⚙️ Настройки"),KeyboardButton(text="❓ Помощь")],
-    ],resize_keyboard=True)
-
-async def cmd_start(msg):
-    global scanner
-    cfg=load_config(); cfg["CHAT_ID"]=str(msg.chat.id); save_config(cfg)
-    if scanner is None: scanner=Scanner(msg.bot)
-    await msg.answer("👋 <b>AutoHunter — охотник за выгодными авто</b>\n\n🎯 Слежу за Авито, Авто.ру, Дромом и Юлой\n💰 Нахожу машины дешевле рынка\n\n<b>Начни с настройки фильтров:</b> /settings\nПотом запусти мониторинг: /run",parse_mode="HTML",reply_markup=kb())
-
-async def cmd_run(msg):
-    global scanner
-    cfg=load_config()
-    if not cfg.get("CHAT_ID"): cfg["CHAT_ID"]=str(msg.chat.id); save_config(cfg)
-    if scanner is None: scanner=Scanner(msg.bot)
-    if scanner.running: await msg.answer("⚠️ Уже запущен. /stop чтобы остановить."); return
-    scanner.start(cfg)
-    await msg.answer(f"✅ Мониторинг запущен!\n⏱ Проверка каждые {cfg.get('CHECK_INTERVAL',15)} мин",reply_markup=kb())
-
-async def cmd_stop(msg):
-    global scanner
-    if scanner and scanner.running: scanner.stop(); await msg.answer("⏹ Остановлен.",reply_markup=kb())
-    else: await msg.answer("ℹ️ Не запущен.")
-
-async def cmd_status(msg):
-    global scanner
-    cfg=load_config(); f=cfg.get("filters",{})
-    st="🟢 Запущен" if (scanner and scanner.running) else "🔴 Остановлен"
-    last=scanner.last_scan.strftime("%H:%M:%S") if (scanner and scanner.last_scan) else "—"
-    sent=scanner.total_sent if scanner else 0
-    await msg.answer(
-        f"📊 <b>Статус</b>\n\n{st}\nПоследняя проверка: {last}\nОтправлено: {sent}\n\n"
-        f"<b>Фильтры:</b>\n💰 {f.get('price_min',0):,} — {f.get('price_max',0):,} ₽\n"
-        f"📅 {f.get('year_min')} — {f.get('year_max')}\n"
-        f"🛣 Пробег до: {f.get('mileage_max',0):,} км\n"
-        f"📉 Скидка от: {f.get('discount_min',0)}%\n"
-        f"📍 Регионы: {', '.join(f.get('regions',[]))}\n"
-        f"🚗 Марки: {', '.join(f.get('brands',[])) or 'все'}\n"
-        f"📡 Источники: {', '.join(f.get('sources',[]))}\n"
-        f"⏱ Интервал: {cfg.get('CHECK_INTERVAL',15)} мин",parse_mode="HTML")
-
-async def cmd_scan(msg):
-    global scanner
-    cfg=load_config()
-    if not cfg.get("CHAT_ID"): cfg["CHAT_ID"]=str(msg.chat.id); save_config(cfg)
-    if scanner is None: scanner=Scanner(msg.bot)
-    await msg.answer("🔍 Запускаю проверку...")
-    try:
-        new=await scanner.scan_once(cfg)
-        if not new: await msg.answer("😔 Новых выгодных объявлений нет.\n\nРасширь фильтры через /settings"); return
-        await msg.answer(f"✅ Найдено {len(new)} объявлений! Отправляю...")
-        for ad in new[:10]:
-            await msg.bot.send_message(cfg["CHAT_ID"],format_ad(ad),parse_mode="HTML")
-            scanner.seen.add(ad.id); await asyncio.sleep(0.8)
-        save_seen(scanner.seen); scanner.total_sent+=len(new[:10])
-    except Exception as e: await msg.answer(f"❌ Ошибка: {e}")
-
-async def cmd_settings(msg):
-    b=InlineKeyboardBuilder()
-    opts=[("💰 Цена","set_price"),("📅 Год","set_year"),("🛣 Пробег","set_mileage"),("📍 Регион","set_region"),("🚗 Марка","set_brand"),("📡 Источники","set_sources"),("⏱ Интервал","set_interval"),("📉 Скидка","set_discount")]
-    for label,cb in opts: b.button(text=label,callback_data=cb)
-    b.adjust(2)
-    await msg.answer("⚙️ <b>Настройки</b>\n\nЧто изменить?",parse_mode="HTML",reply_markup=b.as_markup())
-
-SETTING_PROMPTS={
-    "set_price":("price","💰 Введи диапазон цен через пробел (₽)\nПример: <code>500000 2000000</code>"),
-    "set_year":("year","📅 Введи диапазон годов через пробел\nПример: <code>2015 2024</code>"),
-    "set_mileage":("mileage","🛣 Введи макс. пробег (км)\nПример: <code>150000</code>"),
-    "set_region":("region","📍 Регион(ы) через запятую\nПример: <code>москва, московская</code>"),
-    "set_brand":("brand","🚗 Марки через запятую (или 'все')\nПример: <code>toyota, bmw</code>"),
-    "set_sources":("sources","📡 Источники через запятую\nДоступны: avito, autoru, drom, youla\nПример: <code>avito, autoru, drom</code>"),
-    "set_interval":("interval","⏱ Интервал проверки в минутах (мин. 5)\nПример: <code>10</code>"),
-    "set_discount":("discount","📉 Мин. скидка от рынка (%)\nПример: <code>15</code>"),
+SIGNAL_LABELS = {
+    "urgent":      "🔴 Срочная продажа",
+    "night":       "🌙 Выложено ночью",
+    "price_drop":  "📉 Снижена цена",
+    "low_mileage": "📍 Малый пробег",
 }
 
-async def cb_set(cb,state:FSMContext):
-    key,prompt=SETTING_PROMPTS[cb.data]
-    await state.set_state(S.setting); await state.update_data(k=key)
-    await cb.message.answer(prompt,parse_mode="HTML"); await cb.answer()
+def format_ad(ad):
+    stars    = "★" * (ad.score // 20) + "☆" * (5 - ad.score // 20)
+    sigs     = "\n".join(f"  {SIGNAL_LABELS.get(s,s)}" for s in ad.signals) or "  —"
+    disc_rub = f"{ad.discount_rub:,}".replace(",", " ")
+    price_f  = f"{ad.price:,}".replace(",", " ")
+    mkt_f    = f"{ad.market_price:,}".replace(",", " ")
+    return (
+        f"🚗 {ad.title}\n\n"
+        f"💰 {price_f} ₽  (~рынок: {mkt_f} ₽)\n"
+        f"📉 Ниже рынка: {ad.discount_pct}% ({disc_rub} ₽)\n\n"
+        f"📅 Год: {ad.year or '?'}  |  🛣 Пробег: {ad.mileage:,} км\n"
+        f"📍 {ad.region}  |  📡 {ad.source.upper()}\n"
+        f"🕐 {ad.posted_at}\n\n"
+        f"⚡ Сигналы:\n{sigs}\n\n"
+        f"⭐ Рейтинг: {stars} {ad.score}/100"
+    )
 
-async def process_set(msg,state:FSMContext):
-    d=await state.get_data(); k=d.get("k",""); t=msg.text.strip()
-    cfg=load_config(); f=cfg.setdefault("filters",{})
-    try:
-        if k=="price":
-            p=t.split(); f["price_min"]=int(p[0]); f["price_max"]=int(p[1]) if len(p)>1 else 99999999
-            await msg.answer(f"✅ Цена: {f['price_min']:,} — {f['price_max']:,} ₽")
-        elif k=="year":
-            p=t.split(); f["year_min"]=int(p[0]); f["year_max"]=int(p[1]) if len(p)>1 else 2025
-            await msg.answer(f"✅ Год: {f['year_min']} — {f['year_max']}")
-        elif k=="mileage":
-            f["mileage_max"]=int(t); await msg.answer(f"✅ Пробег до: {f['mileage_max']:,} км")
-        elif k=="region":
-            f["regions"]=[r.strip().lower() for r in t.split(",")]; await msg.answer(f"✅ Регионы: {', '.join(f['regions'])}")
-        elif k=="brand":
-            f["brands"]=[] if t.lower() in ("все","all","") else [b.strip().lower() for b in t.split(",")]
-            await msg.answer(f"✅ Марки: {', '.join(f['brands']) or 'все'}")
-        elif k=="sources":
-            valid={"avito","autoru","drom","youla"}
-            f["sources"]=[s.strip().lower() for s in t.split(",") if s.strip().lower() in valid]
-            await msg.answer(f"✅ Источники: {', '.join(f['sources'])}")
-        elif k=="interval":
-            cfg["CHECK_INTERVAL"]=max(5,int(t)); await msg.answer(f"✅ Интервал: {cfg['CHECK_INTERVAL']} мин")
-        elif k=="discount":
-            f["discount_min"]=int(t); await msg.answer(f"✅ Мин. скидка: {f['discount_min']}%")
-        save_config(cfg)
-    except Exception as e: await msg.answer(f"❌ Ошибка: {e}")
-    await state.clear()
+def make_kb(ad):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Открыть объявление", url=ad.url)]])
 
-async def cmd_help(msg):
-    await msg.answer(
-        "❓ <b>Инструкция</b>\n\n1️⃣ /settings — настрой фильтры\n2️⃣ /run — запусти мониторинг\n3️⃣ Получай уведомления автоматически\n4️⃣ /scan — проверить прямо сейчас\n\n"
-        "<b>Сигналы в сообщениях:</b>\n🔴 Срочная — слово 'срочно' в тексте\n🌙 Ночное — выложено в 22:00–06:00\n🟢 Новое — меньше 3 часов\n💰 Скидка — ниже рыночной цены\n📉 Мин. скидка — выставлен порог\n📍 Малый пробег — до 80 000 км\n🎯 Рейтинг — итоговый балл сделки",
-        parse_mode="HTML")
 
-async def handle_btns(msg):
-    t=msg.text
-    if t=="▶️ Запустить": await cmd_run(msg)
-    elif t=="⏹ Остановить": await cmd_stop(msg)
-    elif t=="📊 Статус": await cmd_status(msg)
-    elif t=="🔍 Проверить сейчас": await cmd_scan(msg)
-    elif t=="⚙️ Настройки": await cmd_settings(msg)
-    elif t=="❓ Помощь": await cmd_help(msg)
+class AutoHunterBot:
+    def __init__(self):
+        self.app     = Application.builder().token(BOT_TOKEN).build()
+        self.avito   = AvitoParser()
+        self.seen    = load_seen()
+        self.filters = load_filters()
+        self.running = False
+        self._reg()
 
-async def main():
-    cfg=load_config()
-    token=cfg.get("BOT_TOKEN","")
-    if not token or token=="8729431872:AAEMuCl2pEx8zd8_o1Twvvy4LeGB-oNMW7E":
-        print("\n"+"="*55)
-        print("  ❌  ТОКЕН НЕ НАСТРОЕН!")
-        print("="*55)
-        print("\n📋 Что делать:")
-        print("  1. Открой Telegram → найди @BotFather")
-        print("  2. Напиши /newbot → придумай имя → получи токен")
-        print("  3. Открой файл  config.json")
-        print('  4. Замени "8729431872:AAEMuCl2pEx8zd8_o1Twvvy4LeGB-oNMW7E"  на свой токен')
-        print("  5. python bot.py  — запусти снова")
-        print("="*55+"\n")
-        return
-    bot=Bot(token=token)
-    dp=Dispatcher(storage=MemoryStorage())
-    dp.message.register(cmd_start,Command("start"))
-    dp.message.register(cmd_run,Command("run"))
-    dp.message.register(cmd_stop,Command("stop"))
-    dp.message.register(cmd_status,Command("status"))
-    dp.message.register(cmd_scan,Command("scan"))
-    dp.message.register(cmd_settings,Command("settings"))
-    dp.message.register(cmd_help,Command("help"))
-    dp.message.register(process_set,StateFilter(S.setting))
-    dp.message.register(handle_btns,F.text)
-    dp.callback_query.register(cb_set,F.data.startswith("set_"))
-    log.info("AutoHunter starting...")
-    await dp.start_polling(bot)
+    def _reg(self):
+        h = self.app.add_handler
+        h(CommandHandler("start",   self.cmd_start))
+        h(CommandHandler("status",  self.cmd_status))
+        h(CommandHandler("filters", self.cmd_filters))
+        h(CommandHandler("hunt",    self.cmd_hunt))
+        h(CommandHandler("pause",   self.cmd_pause))
+        h(CommandHandler("resume",  self.cmd_resume))
+        h(CommandHandler("clear",   self.cmd_clear))
+        h(CommandHandler("set",     self.cmd_set))
+        h(CommandHandler("help",    self.cmd_help))
 
-if __name__=="__main__":
-    asyncio.run(main())
+    async def cmd_start(self, u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        await u.message.reply_text(
+            "🎯 AutoHunter запущен!\n\n"
+            "Буду присылать выгодные авто с Авито.\n\n"
+            "/hunt — найти прямо сейчас\n"
+            "/filters — текущие фильтры\n"
+            "/set параметр значение — изменить\n"
+            "/pause / /resume — пауза\n"
+            "/clear — сбросить историю\n"
+            "/status — статус\n"
+            "/help — справка"
+        )
+        self.running = True
+        asyncio.create_task(self._loop(ctx))
+
+    async def cmd_status(self, u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        status = "✅ Работает" if self.running else "⏸ Пауза"
+        await u.message.reply_text(
+            f"Статус: {status}\n"
+            f"Проверок: {ctx.bot_data.get('checks', 0)}\n"
+            f"Отправлено: {ctx.bot_data.get('sent', 0)}\n"
+            f"Интервал: {self.filters['check_interval']} мин\n"
+            f"Регионы: {', '.join(self.filters['regions'])}"
+        )
+
+    async def cmd_filters(self, u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        f = self.filters
+        brands = ", ".join(f["brands"]) if f["brands"] else "все марки"
+        await u.message.reply_text(
+            f"⚙️ Фильтры:\n\n"
+            f"💰 Цена: {f['price_min']:,} – {f['price_max']:,} ₽\n"
+            f"📅 Год: {f['year_min']} – {f['year_max']}\n"
+            f"🛣 Пробег до: {f['mileage_max']:,} км\n"
+            f"📉 Скидка от: {f['discount_min']}%\n"
+            f"⭐ Рейтинг от: {f['score_min']}/100\n"
+            f"📍 Регионы: {', '.join(f['regions'])}\n"
+            f"🚗 Марки: {brands}\n"
+            f"🔴 Только срочные: {'да' if f['urgent_only'] else 'нет'}\n"
+            f"⏱ Интервал: {f['check_interval']} мин\n\n"
+            f"Изменить: /set параметр значение\n"
+            f"Пример: /set price_max 2000000"
+        )
+
+    async def cmd_set(self, u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        args = ctx.args
+        if len(args) < 2:
+            await u.message.reply_text(
+                "Использование: /set параметр значение\n\n"
+                "Параметры: price_min, price_max, year_min, year_max,\n"
+                "mileage_max, discount_min, score_min,\n"
+                "check_interval, urgent_only (true/false)\n\n"
+                "Пример: /set discount_min 15"
+            )
+            return
+        key, val = args[0], args[1]
+        if key not in self.filters:
+            await u.message.reply_text(f"Неизвестный параметр: {key}")
+            return
+        try:
+            if key == "urgent_only":
+                self.filters[key] = val.lower() in ("true", "1", "да")
+            else:
+                self.filters[key] = int(val)
+            save_filters(self.filters)
+            await u.message.reply_text(f"✅ {key} = {self.filters[key]}")
+        except ValueError:
+            await u.message.reply_text("Ошибка: введи число")
+
+    async def cmd_hunt(self, u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        await u.message.reply_text("🔍 Запускаю поиск...")
+        found = await self._scan(ctx)
+        if found == 0:
+            await u.message.reply_text(
+                "😔 Новых объявлений не найдено.\n\n"
+                "Попробуй:\n"
+                "• /set discount_min 5\n"
+                "• /set score_min 20"
+            )
+
+    async def cmd_pause(self, u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        self.running = False
+        await u.message.reply_text("⏸ Бот на паузе. /resume — возобновить.")
+
+    async def cmd_resume(self, u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not self.running:
+            self.running = True
+            asyncio.create_task(self._loop(ctx))
+        await u.message.reply_text("▶️ Бот возобновлён!")
+
+    async def cmd_clear(self, u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        self.seen.clear()
+        save_seen(self.seen)
+        await u.message.reply_text("🗑 История сброшена.")
+
+    async def cmd_help(self, u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        await u.message.reply_text(
+            "📖 Справка AutoHunter\n\n"
+            "Бот парсит Авито, ищет авто ниже рынка.\n\n"
+            "Рейтинг сделки (0–100):\n"
+            "  Скидка от рынка: до 50 очков\n"
+            "  Срочная продажа: +15\n"
+            "  Ночное объявление: +10\n"
+            "  Снижена цена: +12\n"
+            "  Пробег < 80к км: +8\n"
+            "  Год от 2018: +5\n\n"
+            "Советы:\n"
+            "• discount_min 15-20% — реально выгодные\n"
+            "• urgent_only true — только срочники\n"
+            "• check_interval 5 — самые свежие"
+        )
+
+    async def _scan(self, ctx):
+        all_ads = []
+        for region in self.filters["regions"]:
+            try:
+                ads = await self.avito.fetch(region, self.filters)
+                all_ads.extend(ads)
+                log.info(f"[{region}]: {len(ads)} подходящих")
+            except Exception as e:
+                log.error(f"[{region}]: {e}")
+
+        new_ads = [a for a in all_ads if a.id not in self.seen]
+        new_ads.sort(key=lambda a: a.score, reverse=True)
+
+        sent = 0
+        for ad in new_ads[:10]:
+            try:
+                await ctx.bot.send_message(
+                    chat_id=CHAT_ID,
+                    text=format_ad(ad),
+                    reply_markup=make_kb(ad),
+                )
+                self.seen.add(ad.id)
+                sent += 1
+                await asyncio.sleep(0.8)
+            except Exception as e:
+                log.error(f"Отправка: {e}")
+
+        save_seen(self.seen)
+        ctx.bot_data["checks"] = ctx.bot_data.get("checks", 0) + 1
+        ctx.bot_data["sent"]   = ctx.bot_data.get("sent", 0) + sent
+        log.info(f"Отправлено: {sent}")
+        return sent
+
+    async def _loop(self, ctx):
+        while self.running:
+            try:
+                await self._scan(ctx)
+            except Exception as e:
+                log.error(f"Цикл: {e}")
+            secs = self.filters.get("check_interval", 15) * 60
+            await asyncio.sleep(secs)
+
+    def run(self):
+        log.info("AutoHunter стартует...")
+        self.app.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    AutoHunterBot().run()
+
