@@ -329,9 +329,9 @@ class AutoHunterBot:
 
         for cmd, fn in [
             ("start",   self.cmd_start),
-            ("искать",  self.cmd_hunt),
-            ("фильтры", self.cmd_filters),
-            ("помощь",  self.cmd_help),
+            ("hunt",    self.cmd_hunt),
+            ("filters", self.cmd_filters),
+            ("help",    self.cmd_help),
         ]:
             self.app.add_handler(CommandHandler(cmd, fn))
 
@@ -583,6 +583,7 @@ class AutoHunterBot:
 
 if __name__ == "__main__":
     AutoHunterBot().run()
+
 
 
 
