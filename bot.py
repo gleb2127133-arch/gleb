@@ -6,11 +6,10 @@ import re
 import hashlib
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from typing import Optional
 
 import httpx
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters as tg_filters
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,21 +38,20 @@ DEFAULT_FILTERS = {
     "score_min":      20,
 }
 
-# Коды регионов для Авито RSS
-REGION_CODES = {
-    "moskva":           621540,
-    "spb":              637640,
-    "ekaterinburg":     631389,
-    "novosibirsk":      659900,
-    "krasnodar":        660765,
-    "kazan":            648110,
-    "nizhniy_novgorod": 653469,
-    "rostov":           661270,
-    "ufa":              664483,
-    "samara":           662690,
+REGION_SLUGS = {
+    "москва":           "moskva",
+    "спб":              "sankt-peterburg",
+    "екатеринбург":     "ekaterinburg",
+    "новосибирск":      "novosibirsk",
+    "краснодар":        "krasnodar",
+    "казань":           "kazan",
+    "нижний новгород":  "nizhniy_novgorod",
+    "ростов":           "rostov-na-donu",
+    "уфа":              "ufa",
+    "самара":           "samara",
 }
 
-REGION_NAMES = {
+REGION_NAMES_RU = {
     "moskva":           "Москва",
     "spb":              "Санкт-Петербург",
     "ekaterinburg":     "Екатеринбург",
@@ -66,6 +64,19 @@ REGION_NAMES = {
     "samara":           "Самара",
 }
 
+# Русские названия параметров -> внутренние ключи
+PARAM_MAP = {
+    "минимальная цена":    "price_min",
+    "максимальная цена":   "price_max",
+    "год от":              "year_min",
+    "год до":              "year_max",
+    "пробег до":           "mileage_max",
+    "скидка от":           "discount_min",
+    "рейтинг от":          "score_min",
+    "интервал":            "check_interval",
+}
+
+
 @dataclass
 class CarAd:
     id:           str
@@ -76,11 +87,9 @@ class CarAd:
     mileage:      int
     region:       str
     url:          str
-    source:       str
     posted_at:    str
     signals:      list = field(default_factory=list)
     score:        int  = 0
-    description:  str  = ""
 
     @property
     def discount_pct(self):
@@ -109,86 +118,85 @@ def load_filters():
             return {**DEFAULT_FILTERS, **json.load(f)}
     return DEFAULT_FILTERS.copy()
 
-def save_filters(filters):
-    with open(FILTERS_FILE, "w") as f:
-        json.dump(filters, f, ensure_ascii=False, indent=2)
+def save_filters(f):
+    with open(FILTERS_FILE, "w") as fp:
+        json.dump(f, fp, ensure_ascii=False, indent=2)
 
 
 class AvitoRSSParser:
-    """Парсер через официальный RSS Авито — не блокируется"""
 
     def __init__(self):
         self.client = httpx.AsyncClient(
             timeout=30,
             follow_redirects=True,
             headers={
-                "User-Agent": "Mozilla/5.0 (compatible; RSS reader)",
-                "Accept": "application/rss+xml, application/xml, text/xml",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "ru-RU,ru;q=0.9",
             }
         )
 
-    def _build_url(self, region_key: str, filters: dict) -> str:
-        """Строим URL для RSS Авито"""
-        region_id = REGION_CODES.get(region_key, 621540)
+    def _build_url(self, region_key, filters):
+        slug = region_key if region_key in REGION_NAMES_RU.values() else region_key
+        # Найдём slug по внутреннему ключу
+        slug_map = {v: k for k, v in {
+            "moskva": "moskva", "spb": "sankt-peterburg",
+            "ekaterinburg": "ekaterinburg", "novosibirsk": "novosibirsk",
+            "krasnodar": "krasnodar", "kazan": "kazan",
+            "nizhniy_novgorod": "nizhniy_novgorod", "rostov": "rostov-na-donu",
+            "ufa": "ufa", "samara": "samara",
+        }.items()}
+        avito_slug = {
+            "moskva": "moskva", "spb": "sankt-peterburg",
+            "ekaterinburg": "ekaterinburg", "novosibirsk": "novosibirsk",
+            "krasnodar": "krasnodar", "kazan": "kazan",
+            "nizhniy_novgorod": "nizhniy_novgorod", "rostov": "rostov-na-donu",
+            "ufa": "ufa", "samara": "samara",
+        }.get(region_key, "moskva")
 
-        # Базовый URL RSS для авто
-        params = []
-        params.append(f"locationId={region_id}")
-        params.append("categoryId=9")  # категория Авто
+        params = ["output=rss", "s=104"]
+        brands = filters.get("brands", [])
+        if brands:
+            params.append(f"q={brands[0]}")
+        pmin = filters.get("price_min", 0)
+        pmax = filters.get("price_max", 0)
+        if pmin > 0:
+            params.append(f"pmin={pmin}")
+        if 0 < pmax < 9_999_999:
+            params.append(f"pmax={pmax}")
 
-        brand = filters.get("brands", [])
-        if brand:
-            params.append(f"q={brand[0]}")
+        return f"https://www.avito.ru/{avito_slug}/avtomobili?{'&'.join(params)}"
 
-        price_min = filters.get("price_min", 0)
-        price_max = filters.get("price_max", 0)
-        if price_min > 0:
-            params.append(f"pmin={price_min}")
-        if price_max > 0:
-            params.append(f"pmax={price_max}")
-
-        query_str = "&".join(params)
-        return f"https://www.avito.ru/rss?{query_str}"
-
-    def _parse_price(self, text: str) -> int:
-        if not text:
-            return 0
-        nums = re.sub(r"[^\d]", "", text)
+    def _num(self, text):
+        nums = re.sub(r"[^\d]", "", str(text))
         return int(nums) if nums else 0
 
-    def _parse_year(self, text: str) -> int:
+    def _year(self, text):
         m = re.search(r"\b(20[0-2]\d|199\d)\b", text)
         return int(m.group()) if m else 0
 
-    def _parse_mileage(self, text: str) -> int:
-        # Ищем пробег в описании: "150 000 км" или "150тыс"
-        m = re.search(r"(\d[\d\s]{1,6})\s*(?:тыс\.?\s*км|000\s*км|км)", text, re.IGNORECASE)
+    def _mileage(self, text):
+        m = re.search(r"(\d[\d\s]{1,6})\s*(?:тыс\.?\s*км|000\s*км)", text, re.IGNORECASE)
         if m:
-            num = int(re.sub(r"\s", "", m.group(1)))
-            if num < 1000:
-                num *= 1000
-            return num
+            n = int(re.sub(r"\s", "", m.group(1)))
+            return n * 1000 if n < 1000 else n
         return 0
 
-    def _is_urgent(self, text: str) -> bool:
-        kw = ["срочно", "срочная", "уезжаю", "переезд", "вынужден",
-              "нужны деньги", "торг уместен", "продам быстро"]
-        t = text.lower()
-        return any(k in t for k in kw)
+    def _is_urgent(self, text):
+        kw = ["срочно", "срочная", "уезжаю", "переезд", "вынужден", "нужны деньги", "торг уместен"]
+        return any(k in text.lower() for k in kw)
 
-    def _market_price(self, price: int, year: int, mileage: int) -> int:
+    def _market_price(self, price, year, mileage):
         age = max(0, 2025 - (year or 2018))
-        depreciation = max(0.40, 1.0 - age * 0.055)
-        base = price / depreciation
+        dep = max(0.40, 1.0 - age * 0.055)
+        base = price / dep
         km = mileage or 80_000
-        expected = age * 15_000
-        if km < expected * 0.5:
-            base *= 1.10
-        elif km > expected * 1.8:
-            base *= 0.93
+        exp = age * 15_000
+        if km < exp * 0.5:   base *= 1.10
+        elif km > exp * 1.8: base *= 0.93
         return int(base)
 
-    def _score(self, ad: CarAd) -> int:
+    def _score(self, ad):
         s = min(50, ad.discount_pct * 2.5)
         if "urgent"      in ad.signals: s += 15
         if "price_drop"  in ad.signals: s += 12
@@ -196,109 +204,80 @@ class AvitoRSSParser:
         if ad.year >= 2018:             s += 5
         return min(100, int(s))
 
-    async def fetch(self, region_key: str, filters: dict) -> list:
+    async def fetch(self, region_key, filters):
         url = self._build_url(region_key, filters)
-        log.info(f"RSS запрос: {url}")
-
+        log.info(f"RSS: {url}")
         try:
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(1.5)
             r = await self.client.get(url)
+            log.info(f"RSS статус: {r.status_code}")
             if r.status_code != 200:
-                log.warning(f"RSS [{r.status_code}] для {region_key}")
                 return []
         except Exception as e:
-            log.error(f"RSS fetch: {e}")
+            log.error(f"RSS: {e}")
             return []
 
         try:
             root = ET.fromstring(r.content)
         except ET.ParseError as e:
-            log.error(f"XML parse: {e}")
+            log.error(f"XML: {e}")
             return []
 
-        # Namespace для Авито RSS
-        ns = {"avito": "http://www.avito.ru/rss"}
-
         items = root.findall(".//item")
-        log.info(f"RSS [{region_key}]: {len(items)} объявлений")
+        log.info(f"[{region_key}]: {len(items)} объявлений в RSS")
 
         ads = []
         for item in items[:50]:
             try:
                 title = item.findtext("title", "").strip()
-                if not title:
-                    continue
-
+                if not title: continue
                 link  = item.findtext("link", "").strip()
                 desc  = item.findtext("description", "").strip()
-                price_text = item.findtext("price") or item.findtext("{http://www.avito.ru/rss}price", "")
 
-                # Цена
-                price = self._parse_price(price_text or desc)
-                if price <= 0:
-                    # Попробуем найти цену в заголовке
-                    price = self._parse_price(title)
-                if price <= 0:
-                    continue
-
-                # Фильтр по цене
+                price = 0
+                for tag in ["price", "{http://www.avito.ru/rss}price"]:
+                    v = item.findtext(tag, "")
+                    if v:
+                        price = self._num(v)
+                        break
+                if price == 0:
+                    m = re.search(r"\d[\d\s]{3,}", title + " " + desc)
+                    if m: price = self._num(m.group())
+                if price <= 0: continue
                 if price < filters["price_min"]: continue
                 if price > filters["price_max"]: continue
 
-                # Год и пробег из заголовка/описания
-                full_text = title + " " + desc
-                year    = self._parse_year(full_text)
-                mileage = self._parse_mileage(full_text)
+                full    = title + " " + desc
+                year    = self._year(full)
+                mileage = self._mileage(full)
 
-                # Фильтры
                 if year    and year    < filters["year_min"]:    continue
                 if year    and year    > filters["year_max"]:    continue
                 if mileage and mileage > filters["mileage_max"]: continue
 
-                # Рыночная цена
                 market = self._market_price(price, year or 2018, mileage or 80_000)
                 disc   = (market - price) / market * 100 if market else 0
+                if disc < filters["discount_min"]: continue
 
-                if disc < filters["discount_min"]:
-                    continue
-
-                # Сигналы
                 signals = []
-                if self._is_urgent(full_text):
-                    signals.append("urgent")
-                if re.search(r"снизил|снижена|снижу", full_text.lower()):
-                    signals.append("price_drop")
-                if mileage and mileage < 80_000:
-                    signals.append("low_mileage")
+                if self._is_urgent(full):                               signals.append("urgent")
+                if re.search(r"снизил|снижена|снижу", full.lower()):   signals.append("price_drop")
+                if mileage and mileage < 80_000:                        signals.append("low_mileage")
 
-                if filters.get("urgent_only") and "urgent" not in signals:
-                    continue
-
-                region_name = REGION_NAMES.get(region_key, region_key)
+                if filters.get("urgent_only") and "urgent" not in signals: continue
 
                 ad = CarAd(
                     id=hashlib.md5(link.encode()).hexdigest()[:12],
-                    title=title,
-                    price=price,
-                    market_price=market,
-                    year=year,
-                    mileage=mileage,
-                    region=region_name,
-                    url=link,
-                    source="avito",
-                    posted_at="свежее",
-                    signals=signals,
-                    description=desc[:200],
+                    title=title, price=price, market_price=market,
+                    year=year, mileage=mileage,
+                    region=REGION_NAMES_RU.get(region_key, region_key),
+                    url=link, posted_at="свежее", signals=signals,
                 )
                 ad.score = self._score(ad)
-
                 if ad.score >= filters.get("score_min", 20):
                     ads.append(ad)
-
             except Exception as e:
-                log.debug(f"RSS item: {e}")
-                continue
-
+                log.debug(f"item: {e}")
         return ads
 
     async def close(self):
@@ -311,28 +290,32 @@ SIGNAL_LABELS = {
     "low_mileage": "📍 Малый пробег",
 }
 
-def format_ad(ad: CarAd) -> str:
-    stars    = "★" * (ad.score // 20) + "☆" * (5 - ad.score // 20)
-    sigs     = "\n".join(f"  {SIGNAL_LABELS.get(s, s)}" for s in ad.signals) or "  —"
-    disc_rub = f"{ad.discount_rub:,}".replace(",", " ")
-    price_f  = f"{ad.price:,}".replace(",", " ")
-    mkt_f    = f"{ad.market_price:,}".replace(",", " ")
-    mileage  = f"{ad.mileage:,} км".replace(",", " ") if ad.mileage else "не указан"
-
+def format_ad(ad):
+    stars  = "★" * (ad.score // 20) + "☆" * (5 - ad.score // 20)
+    sigs   = "\n".join(f"  {SIGNAL_LABELS.get(s,s)}" for s in ad.signals) or "  —"
+    d_rub  = f"{ad.discount_rub:,}".replace(",", " ")
+    p_fmt  = f"{ad.price:,}".replace(",", " ")
+    m_fmt  = f"{ad.market_price:,}".replace(",", " ")
+    km_fmt = f"{ad.mileage:,} км".replace(",", " ") if ad.mileage else "не указан"
     return (
         f"🚗 {ad.title}\n\n"
-        f"💰 {price_f} ₽  (~рынок: {mkt_f} ₽)\n"
-        f"📉 Ниже рынка: {ad.discount_pct}% ({disc_rub} ₽)\n\n"
-        f"📅 Год: {ad.year or '?'}  |  🛣 Пробег: {mileage}\n"
+        f"💰 {p_fmt} ₽  (~рынок: {m_fmt} ₽)\n"
+        f"📉 Ниже рынка: {ad.discount_pct}% ({d_rub} ₽)\n\n"
+        f"📅 Год: {ad.year or '?'}  |  🛣 Пробег: {km_fmt}\n"
         f"📍 {ad.region}  |  📡 АВИТО\n\n"
         f"⚡ Сигналы:\n{sigs}\n\n"
         f"⭐ Рейтинг: {stars} {ad.score}/100"
     )
 
-def make_kb(ad: CarAd) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔗 Открыть объявление", url=ad.url)
-    ]])
+def make_kb(ad):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Открыть объявление", url=ad.url)]])
+
+def main_keyboard():
+    return ReplyKeyboardMarkup([
+        ["🔍 Искать сейчас", "⚙️ Фильтры"],
+        ["⏸ Пауза", "▶️ Возобновить"],
+        ["🗑 Сбросить историю", "📊 Статус"],
+    ], resize_keyboard=True)
 
 
 class AutoHunterBot:
@@ -342,194 +325,227 @@ class AutoHunterBot:
         self.seen    = load_seen()
         self.filters = load_filters()
         self.running = False
-        self._reg()
+        self.waiting_input = {}  # chat_id -> параметр который ждём
 
-    def _reg(self):
-        h = self.app.add_handler
-        h(CommandHandler("start",   self.cmd_start))
-        h(CommandHandler("status",  self.cmd_status))
-        h(CommandHandler("filters", self.cmd_filters))
-        h(CommandHandler("hunt",    self.cmd_hunt))
-        h(CommandHandler("pause",   self.cmd_pause))
-        h(CommandHandler("resume",  self.cmd_resume))
-        h(CommandHandler("clear",   self.cmd_clear))
-        h(CommandHandler("set",     self.cmd_set))
-        h(CommandHandler("region",  self.cmd_region))
-        h(CommandHandler("brand",   self.cmd_brand))
-        h(CommandHandler("help",    self.cmd_help))
+        for cmd, fn in [
+            ("start",   self.cmd_start),
+            ("искать",  self.cmd_hunt),
+            ("фильтры", self.cmd_filters),
+            ("помощь",  self.cmd_help),
+        ]:
+            self.app.add_handler(CommandHandler(cmd, fn))
+
+        self.app.add_handler(MessageHandler(tg_filters.TEXT & ~tg_filters.COMMAND, self.on_text))
 
     async def cmd_start(self, u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text(
             "🎯 AutoHunter запущен!\n\n"
-            "Ищу выгодные авто на Авито через RSS.\n\n"
-            "/hunt — найти прямо сейчас\n"
-            "/filters — текущие фильтры\n"
-            "/set параметр значение — изменить\n"
-            "/region add/remove регион\n"
-            "/brand add/remove марка\n"
-            "/pause / /resume — пауза\n"
-            "/clear — сбросить историю\n"
-            "/status — статус\n"
-            "/help — справка"
+            "Я ищу выгодные авто на Авито и присылаю тебе лучшие сделки.\n\n"
+            "Используй кнопки внизу 👇",
+            reply_markup=main_keyboard()
         )
         self.running = True
         asyncio.create_task(self._loop(ctx))
 
-    async def cmd_status(self, u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        status = "✅ Работает" if self.running else "⏸ Пауза"
-        await u.message.reply_text(
-            f"Статус: {status}\n"
-            f"Проверок: {ctx.bot_data.get('checks', 0)}\n"
-            f"Отправлено: {ctx.bot_data.get('sent', 0)}\n"
-            f"Интервал: {self.filters['check_interval']} мин\n"
-            f"Регионы: {', '.join(self.filters['regions'])}"
-        )
+    async def on_text(self, u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        text = u.message.text.strip()
+        chat_id = u.effective_chat.id
 
-    async def cmd_filters(self, u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        f = self.filters
-        brands = ", ".join(f["brands"]) if f["brands"] else "все марки"
-        await u.message.reply_text(
-            f"⚙️ Фильтры:\n\n"
-            f"💰 Цена: {f['price_min']:,} – {f['price_max']:,} ₽\n"
-            f"📅 Год: {f['year_min']} – {f['year_max']}\n"
-            f"🛣 Пробег до: {f['mileage_max']:,} км\n"
-            f"📉 Скидка от: {f['discount_min']}%\n"
-            f"⭐ Рейтинг от: {f['score_min']}/100\n"
-            f"📍 Регионы: {', '.join(f['regions'])}\n"
-            f"🚗 Марки: {brands}\n"
-            f"🔴 Только срочные: {'да' if f['urgent_only'] else 'нет'}\n"
-            f"⏱ Интервал: {f['check_interval']} мин\n\n"
-            f"Изменить: /set параметр значение\n"
-            f"Пример: /set price_max 2000000"
-        )
-
-    async def cmd_set(self, u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        args = ctx.args
-        if len(args) < 2:
+        # Кнопки меню
+        if text == "🔍 Искать сейчас":
+            await self.cmd_hunt(u, ctx)
+            return
+        if text == "⚙️ Фильтры":
+            await self.cmd_filters(u, ctx)
+            return
+        if text == "⏸ Пауза":
+            self.running = False
+            await u.message.reply_text("⏸ Бот поставлен на паузу.", reply_markup=main_keyboard())
+            return
+        if text == "▶️ Возобновить":
+            if not self.running:
+                self.running = True
+                asyncio.create_task(self._loop(ctx))
+            await u.message.reply_text("▶️ Возобновлён!", reply_markup=main_keyboard())
+            return
+        if text == "🗑 Сбросить историю":
+            self.seen.clear()
+            save_seen(self.seen)
+            await u.message.reply_text("🗑 История сброшена — получу объявления заново.", reply_markup=main_keyboard())
+            return
+        if text == "📊 Статус":
+            status = "✅ Работает" if self.running else "⏸ Пауза"
             await u.message.reply_text(
-                "Использование: /set параметр значение\n\n"
-                "Параметры:\n"
-                "price_min, price_max\n"
-                "year_min, year_max\n"
-                "mileage_max\n"
-                "discount_min (% скидки от рынка)\n"
-                "score_min (рейтинг 0-100)\n"
-                "check_interval (минуты)\n"
-                "urgent_only (true/false)\n\n"
-                "Пример: /set discount_min 10"
+                f"Статус: {status}\n"
+                f"Проверок выполнено: {ctx.bot_data.get('checks', 0)}\n"
+                f"Отправлено объявлений: {ctx.bot_data.get('sent', 0)}\n"
+                f"Проверка каждые: {self.filters['check_interval']} мин\n"
+                f"Регионы: {', '.join(REGION_NAMES_RU.get(r, r) for r in self.filters['regions'])}",
+                reply_markup=main_keyboard()
             )
             return
-        key, val = args[0], args[1]
-        if key not in self.filters:
-            await u.message.reply_text(f"Неизвестный параметр: {key}")
-            return
-        try:
-            if key == "urgent_only":
-                self.filters[key] = val.lower() in ("true", "1", "да")
-            else:
-                self.filters[key] = int(val)
-            save_filters(self.filters)
-            await u.message.reply_text(f"✅ {key} = {self.filters[key]}")
-        except ValueError:
-            await u.message.reply_text("Ошибка: введи число")
 
-    async def cmd_region(self, u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        args = ctx.args
-        if len(args) < 2:
-            regions_list = "\n".join(f"  • {k}" for k in REGION_CODES)
-            await u.message.reply_text(
-                f"Использование:\n"
-                f"/region add moskva\n"
-                f"/region remove spb\n\n"
-                f"Доступные:\n{regions_list}"
-            )
-            return
-        action, name = args[0], args[1].lower()
-        if action == "add":
-            if name not in self.filters["regions"]:
-                self.filters["regions"].append(name)
+        # Ожидаем ввод значения параметра
+        if chat_id in self.waiting_input:
+            param = self.waiting_input.pop(chat_id)
+            try:
+                val = int(text.replace(" ", "").replace(",", ""))
+                self.filters[param] = val
                 save_filters(self.filters)
-            await u.message.reply_text(f"✅ Добавлен: {name}\nСейчас: {', '.join(self.filters['regions'])}")
-        elif action == "remove":
-            self.filters["regions"] = [r for r in self.filters["regions"] if r != name]
-            save_filters(self.filters)
-            await u.message.reply_text(f"✅ Удалён: {name}\nСейчас: {', '.join(self.filters['regions'])}")
+                param_ru = {v: k for k, v in PARAM_MAP.items()}.get(param, param)
+                await u.message.reply_text(f"✅ {param_ru.capitalize()} = {val:,} ₽".replace(",", " "), reply_markup=main_keyboard())
+            except ValueError:
+                await u.message.reply_text("❌ Введи число, например: 1500000", reply_markup=main_keyboard())
+            return
 
-    async def cmd_brand(self, u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        args = ctx.args
-        if len(args) < 1:
-            brands = ", ".join(self.filters["brands"]) or "все марки"
+        # Настройка фильтров через кнопки
+        filter_actions = {
+            "💰 Минимальная цена":  "price_min",
+            "💰 Максимальная цена": "price_max",
+            "📅 Год от":            "year_min",
+            "📅 Год до":            "year_max",
+            "🛣 Пробег до (км)":    "mileage_max",
+            "📉 Скидка от (%)":     "discount_min",
+            "⭐ Рейтинг от":        "score_min",
+            "⏱ Интервал (мин)":    "check_interval",
+        }
+
+        if text in filter_actions:
+            param = filter_actions[text]
+            self.waiting_input[chat_id] = param
+            current = self.filters[param]
             await u.message.reply_text(
-                f"Текущие марки: {brands}\n\n"
-                f"/brand add Toyota\n"
-                f"/brand remove Toyota\n"
-                f"/brand clear — все марки"
+                f"Введи новое значение для «{text}»\n"
+                f"Сейчас: {current:,}".replace(",", " ")
             )
             return
-        action = args[0]
-        if action == "clear":
-            self.filters["brands"] = []
-        elif len(args) >= 2:
-            brand = args[1].capitalize()
-            if action == "add" and brand not in self.filters["brands"]:
-                self.filters["brands"].append(brand)
-            elif action == "remove":
-                self.filters["brands"] = [b for b in self.filters["brands"] if b != brand]
-        save_filters(self.filters)
-        brands = ", ".join(self.filters["brands"]) or "все марки"
-        await u.message.reply_text(f"✅ Марки: {brands}")
+
+        region_actions = {
+            "📍 Москва":           "moskva",
+            "📍 Санкт-Петербург":  "spb",
+            "📍 Екатеринбург":     "ekaterinburg",
+            "📍 Новосибирск":      "novosibirsk",
+            "📍 Краснодар":        "krasnodar",
+            "📍 Казань":           "kazan",
+            "📍 Нижний Новгород":  "nizhniy_novgorod",
+            "📍 Ростов-на-Дону":   "rostov",
+            "📍 Уфа":              "ufa",
+            "📍 Самара":           "samara",
+        }
+
+        if text in region_actions:
+            region = region_actions[text]
+            if region in self.filters["regions"]:
+                self.filters["regions"].remove(region)
+                await u.message.reply_text(f"❌ Регион убран: {text[2:]}", reply_markup=main_keyboard())
+            else:
+                self.filters["regions"].append(region)
+                await u.message.reply_text(f"✅ Регион добавлен: {text[2:]}", reply_markup=main_keyboard())
+            save_filters(self.filters)
+            return
+
+        if text == "🔴 Только срочные: ВКЛ":
+            self.filters["urgent_only"] = False
+            save_filters(self.filters)
+            await u.message.reply_text("✅ Показывать все объявления", reply_markup=main_keyboard())
+            return
+        if text == "🔴 Только срочные: ВЫКЛ":
+            self.filters["urgent_only"] = True
+            save_filters(self.filters)
+            await u.message.reply_text("✅ Только срочные продажи", reply_markup=main_keyboard())
+            return
+        if text == "◀️ Назад":
+            await u.message.reply_text("Главное меню", reply_markup=main_keyboard())
+            return
 
     async def cmd_hunt(self, u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        await u.message.reply_text("🔍 Запускаю поиск через RSS...")
+        await u.message.reply_text("🔍 Ищу выгодные авто...")
         found = await self._scan(ctx)
         if found == 0:
             await u.message.reply_text(
                 "😔 Новых объявлений не найдено.\n\n"
-                "Попробуй расширить фильтры:\n"
-                "/set discount_min 0\n"
-                "/set score_min 0\n"
-                "/set price_max 9999999"
+                "Попробуй снизить фильтры в ⚙️ Фильтры:\n"
+                "• Уменьши «Скидка от»\n"
+                "• Уменьши «Рейтинг от»\n"
+                "• Расширь диапазон цен",
+                reply_markup=main_keyboard()
             )
 
-    async def cmd_pause(self, u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        self.running = False
-        await u.message.reply_text("⏸ Пауза. /resume — возобновить.")
+    async def cmd_filters(self, u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        f = self.filters
+        brands = ", ".join(f["brands"]) if f["brands"] else "все марки"
+        regions_ru = ", ".join(REGION_NAMES_RU.get(r, r) for r in f["regions"])
+        urgent = "только срочные" if f["urgent_only"] else "все"
 
-    async def cmd_resume(self, u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        if not self.running:
-            self.running = True
-            asyncio.create_task(self._loop(ctx))
-        await u.message.reply_text("▶️ Возобновлён!")
+        filter_keyboard = ReplyKeyboardMarkup([
+            ["💰 Минимальная цена", "💰 Максимальная цена"],
+            ["📅 Год от",           "📅 Год до"],
+            ["🛣 Пробег до (км)",   "📉 Скидка от (%)"],
+            ["⭐ Рейтинг от",       "⏱ Интервал (мин)"],
+            ["📍 Регионы",          "🔴 Только срочные: " + ("ВКЛ" if f["urgent_only"] else "ВЫКЛ")],
+            ["◀️ Назад"],
+        ], resize_keyboard=True)
 
-    async def cmd_clear(self, u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        self.seen.clear()
-        save_seen(self.seen)
-        await u.message.reply_text("🗑 История сброшена.")
+        await u.message.reply_text(
+            f"⚙️ Текущие фильтры:\n\n"
+            f"💰 Цена: {f['price_min']:,} – {f['price_max']:,} ₽\n"
+            f"📅 Год: {f['year_min']} – {f['year_max']}\n"
+            f"🛣 Пробег до: {f['mileage_max']:,} км\n"
+            f"📉 Скидка от рынка: {f['discount_min']}%\n"
+            f"⭐ Рейтинг сделки от: {f['score_min']}/100\n"
+            f"📍 Регионы: {regions_ru}\n"
+            f"🚗 Марки: {brands}\n"
+            f"🔴 Объявления: {urgent}\n"
+            f"⏱ Проверка каждые: {f['check_interval']} мин\n\n"
+            f"Нажми кнопку чтобы изменить 👇".replace(",", " "),
+            reply_markup=filter_keyboard
+        )
+
+        # Показываем кнопки регионов если нажали "Регионы"
+    async def show_regions(self, u: Update):
+        regions_keyboard = ReplyKeyboardMarkup([
+            ["📍 Москва",          "📍 Санкт-Петербург"],
+            ["📍 Екатеринбург",    "📍 Новосибирск"],
+            ["📍 Краснодар",       "📍 Казань"],
+            ["📍 Нижний Новгород", "📍 Ростов-на-Дону"],
+            ["📍 Уфа",             "📍 Самара"],
+            ["◀️ Назад"],
+        ], resize_keyboard=True)
+        active = ", ".join(REGION_NAMES_RU.get(r, r) for r in self.filters["regions"])
+        await u.message.reply_text(
+            f"Нажми на регион чтобы добавить/убрать.\n"
+            f"Активные: {active}",
+            reply_markup=regions_keyboard
+        )
 
     async def cmd_help(self, u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text(
-            "📖 Справка AutoHunter\n\n"
-            "Бот парсит Авито через RSS и ищет авто ниже рынка.\n\n"
-            "Рейтинг сделки (0–100):\n"
+            "📖 Как пользоваться AutoHunter\n\n"
+            "🔍 Искать сейчас — запустить поиск\n"
+            "⚙️ Фильтры — настроить параметры поиска\n"
+            "⏸ Пауза — остановить автопоиск\n"
+            "▶️ Возобновить — запустить снова\n"
+            "🗑 Сбросить историю — получить старые объявления заново\n"
+            "📊 Статус — посмотреть статистику\n\n"
+            "Как работает рейтинг сделки (0-100):\n"
             "  Скидка от рынка: до 50 очков\n"
             "  Срочная продажа: +15\n"
             "  Снижена цена: +12\n"
-            "  Пробег < 80к км: +8\n"
+            "  Малый пробег: +8\n"
             "  Год от 2018: +5\n\n"
             "Советы перекупщику:\n"
-            "• discount_min 10-15% = реально выгодные\n"
-            "• urgent_only true = только срочники\n"
-            "• check_interval 5 = самые свежие\n"
-            "• Добавь несколько регионов для охвата"
+            "• Скидка от 10-15% = реально выгодные\n"
+            "• Включи «только срочные» для быстрых сделок\n"
+            "• Интервал 5 мин = самые свежие объявления",
+            reply_markup=main_keyboard()
         )
 
-    async def _scan(self, ctx) -> int:
+    async def _scan(self, ctx):
         all_ads = []
         for region in self.filters["regions"]:
             try:
                 ads = await self.parser.fetch(region, self.filters)
                 all_ads.extend(ads)
-                log.info(f"[{region}]: {len(ads)} подходящих")
             except Exception as e:
                 log.error(f"[{region}]: {e}")
 
@@ -539,11 +555,7 @@ class AutoHunterBot:
         sent = 0
         for ad in new_ads[:10]:
             try:
-                await ctx.bot.send_message(
-                    chat_id=CHAT_ID,
-                    text=format_ad(ad),
-                    reply_markup=make_kb(ad),
-                )
+                await ctx.bot.send_message(chat_id=CHAT_ID, text=format_ad(ad), reply_markup=make_kb(ad))
                 self.seen.add(ad.id)
                 sent += 1
                 await asyncio.sleep(0.5)
@@ -562,15 +574,15 @@ class AutoHunterBot:
                 await self._scan(ctx)
             except Exception as e:
                 log.error(f"Цикл: {e}")
-            secs = self.filters.get("check_interval", 15) * 60
-            await asyncio.sleep(secs)
+            await asyncio.sleep(self.filters.get("check_interval", 15) * 60)
 
     def run(self):
-        log.info("AutoHunter RSS стартует...")
+        log.info("AutoHunter стартует...")
         self.app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
     AutoHunterBot().run()
+
 
 
